@@ -60,7 +60,7 @@ function validateFilters(config, baseTable, filters) {
     const resolved = splitQualified(filter.column, baseTable);
     ensureColumn(config, resolved.table, resolved.column);
     if (!config.allowedOperators.includes(filter.operator)) {
-      throw new Error(`Invalid operator: ${filter.operator}`);
+      throw new McpError(`Invalid operator: ${filter.operator}`, "VALIDATION_FAILED", { operator: filter.operator });
     }
   }
 }
@@ -68,7 +68,7 @@ function validateFilters(config, baseTable, filters) {
 function validateAggregations(config, baseTable, aggregations) {
   for (const agg of aggregations) {
     if (!config.allowedAggregations.includes(agg.type)) {
-      throw new Error(`Invalid aggregation: ${agg.type}`);
+      throw new McpError(`Invalid aggregation: ${agg.type}`, "VALIDATION_FAILED", { aggregation: agg.type });
     }
     const resolved = splitQualified(agg.column, baseTable);
     ensureColumn(config, resolved.table, resolved.column);
@@ -80,7 +80,7 @@ function validateConsistency(plan) {
   if (plan.aggregations && plan.aggregations.length > 0) {
     if (!plan.groupBy) plan.groupBy = [];
     const groupSet = new Set(plan.groupBy);
-    
+
     for (const col of plan.columns || []) {
       if (!groupSet.has(col)) {
         plan.groupBy.push(col);

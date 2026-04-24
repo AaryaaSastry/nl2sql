@@ -1,16 +1,32 @@
 {
-  "name": "telecom-mcp",
+  "name": "universal-db-mcp",
   "version": "1.2.0",
-  "description": "MCP server for Supabase-backed telecom data",
+  "description": "Universal Database MCP Server - Connect to any Supabase database and query with natural language",
   "type": "module",
   "main": "index.js",
+  "engines": {
+    "node": ">=18.0.0"
+  },
   "scripts": {
-    "start": "node index.js"
+    "start": "node index.js",
+    "dev": "node --watch index.js"
   },
   "dependencies": {
-    "@modelcontextprotocol/sdk": "^1.0.0",
-    "@supabase/supabase-js": "^2.0.0",
-    "dotenv": "^16.0.0",
-    "zod": "^4.0.0"
-  }
+    "@modelcontextprotocol/sdk": "1.0.0",
+    "@supabase/supabase-js": "^2.38.0",
+    "dotenv": "^16.3.1",
+    "zod": "^3.22.4"
+  },
+  "devDependencies": {
+    "supabase": "^2.95.0"
+  },
+  "keywords": [
+    "mcp",
+    "database",
+    "supabase",
+    "natural-language",
+    "ai"
+  ],
+  "author": "",
+  "license": "MIT"
 }

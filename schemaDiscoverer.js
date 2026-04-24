@@ -55,7 +55,7 @@ export async function discoverSchema(supabaseClient) {
   });
 
   // 5. Default safety configs
-  const allowedAggregations = ["SUM", "AVG", "COUNT", "MIN", "MAX"];
+  const allowedAggregations = ["SUM", "AVG", "COUNT", "COUNT_DISTINCT", "MIN", "MAX"];
   const allowedOperators = ["=", "!=", ">", "<", ">=", "<=", "LIKE", "ILIKE", "IN", "IS NULL", "IS NOT NULL"];
   const MAX_LIMIT = 50;
 

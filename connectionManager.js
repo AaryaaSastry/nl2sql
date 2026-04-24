@@ -3,12 +3,10 @@ import { discoverSchema } from "./schemaDiscoverer.js";
 
 class ConnectionManager {
   constructor() {
-    this.connections = new Map(); // alias -> { supabase, config }
+    this.connections = new Map(); // alias -> { supabase, config, url, key }
   }
 
   async register(alias, url, key) {
-    // console.error(`[ConnectionManager] Registering DB: ${alias} (${url})`);
-    
     // Create client
     const supabase = createClient(url, key);
 
@@ -25,9 +23,10 @@ class ConnectionManager {
 
     // Discover schema
     const config = await discoverSchema(supabase);
-    
-    this.connections.set(alias, { supabase, config });
-    
+
+    // Store connection WITH url and key so refresh_schema can re-register
+    this.connections.set(alias, { supabase, config, url, key });
+
     return {
       config,
       tableCount: Object.keys(config.schema).length,

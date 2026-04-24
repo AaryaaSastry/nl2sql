@@ -1,4 +1,5 @@
 import { findJoinPath } from "./joinResolver.js";
+import { validateSqlExpression } from "./safety.js";
 
 /**
  * Generates SQL from a structured plan.
@@ -30,7 +31,7 @@ export function buildSQL(plan, config) {
   for (const agg of aggregations) {
     const aggAlias = agg.alias || `${agg.type.toLowerCase().replace(/\./g, '_')}_${agg.column.replace(/\./g, '_')}`;
     const aggType = agg.type.toUpperCase();
-    
+
     if (aggType === "COUNT_DISTINCT") {
       selectParts.push(`COUNT(DISTINCT ${agg.column}) AS ${aggAlias}`);
     } else {
@@ -47,12 +48,12 @@ export function buildSQL(plan, config) {
   if (joins.length > 0) {
     const fullPathStrings = [];
     const visited = new Set();
-    
+
     for (const joinTarget of joins) {
       if (visited.has(joinTarget)) continue;
 
       const path = findJoinPath(table, joinTarget, relations);
-      
+
       let prevTable = table;
       for (const nextTable of path) {
         if (!visited.has(nextTable)) {
@@ -72,20 +73,13 @@ export function buildSQL(plan, config) {
   let whereClause = "";
   if (filters.length > 0) {
     const filterStrings = filters.map((f, i) => {
-      const val = String(f.value);
-      // Check if value looks like a PostgreSQL expression (NOW(), INTERVAL, etc.)
-      const isSqlExpression = /^(NOW\(\)|CURRENT_DATE|INTERVAL\s+)/i.test(val) || val.includes("INTERVAL");
-      
+      const isSqlExpression = validateSqlExpression(f.value);
+
       if (isSqlExpression) {
-        // Direct injection (sanitized) for SQL expressions
-        // Only allow specific safe words to prevent full SQL injection
-        const safeRegex = /^[A-Z0-9()., '\-]+$/i;
-        if (!safeRegex.test(val)) {
-            throw new Error(`Unsafe SQL expression in filter: ${val}`);
-        }
-        return `${f.column} ${f.operator} ${val}`;
+        // Direct injection for whitelisted SQL expressions
+        return `${f.column} ${f.operator} ${f.value}`;
       } else {
-        // Standard parameterization
+        // Standard parameterization for literals
         params.push(f.value);
         return `${f.column} ${f.operator} $${params.length}`;
       }

@@ -12,7 +12,7 @@ dotenv.config({ path: path.join(__dirname, ".env") });
 import { connectionManager } from "./connectionManager.js";
 import { buildSQL } from "./sqlBuilder.js";
 import { validatePlan } from "./validator.js";
-import { callLLM } from "./llm.js";
+import { callLLM, analyzeResults } from "./llm.js";
 import { ensureSqlSafety } from "./safety.js";
 import { generateInsights } from "./insightGenerator.js";
 import { McpError, logger } from "./errors.js";
@@ -24,7 +24,7 @@ async function initializeDefault() {
   if (url && key) {
     try {
       await connectionManager.register("default", url, key);
-      logger.info(`Default database connection established with URL: ${url}`);
+      logger.info(`Default database connection established`, { url });
     } catch (e) {
       logger.error("Default connection failed", e);
     }
@@ -46,6 +46,39 @@ const server = new McpServer(
 );
 
 server.registerTool(
+  "health_check",
+  {
+    title: "Health check",
+    description: "Check server status, version, and registered databases.",
+    inputSchema: z.object({})
+  },
+  async () => {
+    try {
+      const dbList = connectionManager.list();
+      const hasGeminiKey = !!process.env.GEMINI_API_KEY;
+
+      return {
+        content: [{
+          type: "text",
+          text: `
+Server Status: HEALTHY
+Version: 1.2.0
+Databases Registered: ${dbList.length}
+${dbList.map(db => `  - ${db.alias}: ${db.tables} tables`).join("\n")}
+Gemini API: ${hasGeminiKey ? "✓ Configured" : "✗ Missing"}
+          `.trim()
+        }]
+      };
+    } catch (e) {
+      return {
+        content: [{ type: "text", text: `Health check failed: ${e.message}` }],
+        isError: true
+      };
+    }
+  }
+);
+
+server.registerTool(
   "register_db",
   {
     title: "Register a new database",
@@ -58,38 +91,33 @@ server.registerTool(
   },
   async ({ alias, url, key }) => {
     try {
-      // Pre-flight check for execute_sql RPC
-      const tempClient = (await import("@supabase/supabase-js")).createClient(url, key);
-      const { error: rpcError } = await tempClient.rpc("execute_sql", { sql: "SELECT 1" });
-      
-      if (rpcError && rpcError.message.includes("could not find the function")) {
+      const summary = await connectionManager.register(alias, url, key);
+      return {
+        content: [{
+          type: "text",
+          text: `Successfully registered "${alias}". Tables discovered: ${summary.tables.join(", ")}`
+        }]
+      };
+    } catch (error) {
+      if (error.message.includes("execute_sql")) {
         return {
-          content: [{ 
-            type: "text", 
+          content: [{
+            type: "text",
             text: `Error: The "execute_sql" RPC function is missing from this database.\n\n` +
-                  `Please run the following SQL in the Supabase SQL Editor to enable this server:\n\n` +
-                  `CREATE OR REPLACE FUNCTION execute_sql(sql text)\n` +
-                  `RETURNS jsonb\n` +
-                  `LANGUAGE plpgsql\n` +
-                  `SECURITY DEFINER\n` +
-                  `AS $$\n` +
-                  `BEGIN\n` +
-                  `  RETURN (SELECT jsonb_agg(t) FROM (EXECUTE sql) t);\n` +
-                  `END;\n` +
-                  `$$;`
+              `Please run the following SQL in the Supabase SQL Editor to enable this server:\n\n` +
+              `CREATE OR REPLACE FUNCTION execute_sql(sql text)\n` +
+              `RETURNS jsonb\n` +
+              `LANGUAGE plpgsql\n` +
+              `SECURITY DEFINER\n` +
+              `AS $$\n` +
+              `BEGIN\n` +
+              `  RETURN (SELECT jsonb_agg(t) FROM (EXECUTE sql) t);\n` +
+              `END;\n` +
+              `$$;`
           }],
           isError: true
         };
       }
-
-      const summary = await connectionManager.register(alias, url, key);
-      return {
-        content: [{ 
-          type: "text", 
-          text: `Successfully registered "${alias}". Tables discovered: ${summary.tables.join(", ")}` 
-        }]
-      };
-    } catch (error) {
       return {
         content: [{ type: "text", text: error.message }],
         isError: true
@@ -108,7 +136,7 @@ server.registerTool(
   async () => {
     const list = connectionManager.connections;
     if (list.size === 0) return { content: [{ type: "text", text: "No databases registered." }] };
-    
+
     const summary = Array.from(list.entries()).map(([alias, { config }]) => {
       return `Database: ${alias}\nTables: ${Object.keys(config.schema).join(", ")}`;
     }).join("\n---\n");
@@ -133,7 +161,7 @@ server.registerTool(
   async ({ db, table, limit }) => {
     try {
       const { supabase, config } = connectionManager.get(db);
-      
+
       if (!config.schema[table]) {
         return {
           content: [{ type: "text", text: `Error: Table '${table}' not found in database '${db}'.` }],
@@ -203,7 +231,7 @@ server.registerTool(
   async ({ db, plan, execute }) => {
     try {
       const { supabase, config } = connectionManager.get(db);
-      
+
       let validatedPlan;
       try {
         validatedPlan = validatePlan(plan, config);
@@ -251,7 +279,7 @@ server.registerTool(
   {
     title: "Natural language query",
     description: "The primary tool for answering any natural language questions about the database. " +
-                 "It automatically discovers schema, handles joins, and performs aggregations to answer complex business questions.",
+      "It automatically discovers schema, handles joins, and performs aggregations to answer complex business questions.",
     inputSchema: z.object({
       db: z.string().optional().default("default").describe("Database alias (default is 'default')"),
       query: z.string().describe("The user's natural language question (e.g., 'Who are the top 5 customers by data usage?')")
@@ -259,24 +287,63 @@ server.registerTool(
   },
   async ({ db, query }) => {
     try {
+      // Step 0: Input validation - reject long queries to prevent prompt injection and runaway costs
+      const MAX_QUERY_LENGTH = 500;
+      if (query.length > MAX_QUERY_LENGTH) {
+        return {
+          content: [{
+            type: "text",
+            text: `Query too long (${query.length} chars, max ${MAX_QUERY_LENGTH}). Please ask a more specific question.`
+          }],
+          isError: true
+        };
+      }
+
       const { supabase, config } = connectionManager.get(db);
-      
-      // Step 1: LLM to Plan
-      const plan = await callLLM(query, config);
-      
-      // Step 2: Validate
-      const validatedPlan = validatePlan(plan, config);
-      
+
+      // Step 1: LLM to Plan (with retry logic)
+      let plan;
+      let validatedPlan;
+      let retryCount = 0;
+      const maxRetries = 1;
+
+      while (retryCount <= maxRetries) {
+        try {
+          plan = await callLLM(query, config);
+          validatedPlan = validatePlan(plan, config);
+          break; // Success
+        } catch (validationError) {
+          retryCount++;
+          if (retryCount > maxRetries) {
+            // Final failure
+            logger.error("Query validation failed after retries", validationError);
+            throw validationError;
+          }
+
+          // Retry: Feed error back to LLM
+          logger.warn("Query validation failed, retrying", { error: validationError.message, retryCount });
+          const correctionPrompt = `${query}\n\nPrevious attempt failed with: "${validationError.message}". Please look at the schema again and provide a corrected plan.`;
+          try {
+            plan = await callLLM(correctionPrompt, config);
+            validatedPlan = validatePlan(plan, config);
+            break;
+          } catch (e) {
+            // Still failed on retry
+            continue;
+          }
+        }
+      }
+
       // Step 3: SQL
       const { sql: rawSql, params } = buildSQL(validatedPlan, config);
       const sql = rawSql.trim().replace(/;+\s*$/, "");
-      
+
       // Step 4: Safety & Execution
       ensureSqlSafety(sql);
-      
+
       // Execute query
       const rpcName = process.env.SUPABASE_SQL_RPC || "execute_sql";
-      
+
       let finalData;
       let { data, error } = await supabase.rpc(rpcName, { sql, params });
 
@@ -286,13 +353,11 @@ server.registerTool(
         if (params && params.length > 0) {
           params.forEach((val, i) => {
             const escaped = typeof val === 'string' ? `'${val.replace(/'/g, "''")}'` : (val === null ? 'NULL' : val);
-            // Replace $1, $2, etc. with escaped values. 
-            // Using a regex to ensure we don't replace parts of other numbers (e.g. $11)
             const regex = new RegExp(`\\$${i + 1}(?![0-9])`, 'g');
             hydratedSql = hydratedSql.replace(regex, escaped);
           });
         }
-        
+
         const retry = await supabase.rpc(rpcName, { sql: hydratedSql });
         if (retry.error) {
           logger.error("Hydrated fallback query failed", retry.error);
@@ -307,10 +372,16 @@ server.registerTool(
       }
 
       const insights = generateInsights(finalData, query);
+      const analystReport = await analyzeResults(query, finalData, config);
+
+      let finalContent = insights;
+      if (analystReport) {
+        finalContent = `\n---\n### 🧠 AI Analyst Report\n${analystReport}\n\n---\n${insights}`;
+      }
 
       return {
         content: [
-          { type: "text", text: insights }
+          { type: "text", text: finalContent }
         ]
       };
     } catch (e) {
@@ -335,9 +406,19 @@ server.registerTool(
   },
   async ({ db }) => {
     try {
-      const { supabase } = connectionManager.get(db);
-      const url = supabase.supabaseUrl;
-      const key = supabase.supabaseKey;
+      const conn = connectionManager.get(db);
+      const { url, key } = conn;
+
+      if (!url || !key) {
+        return {
+          content: [{
+            type: "text",
+            text: `Error: Cannot refresh schema for "${db}". Connection credentials not found.`
+          }],
+          isError: true
+        };
+      }
+
       await connectionManager.register(db, url, key);
       return {
         content: [{ type: "text", text: `Schema for "${db}" refreshed successfully.` }]

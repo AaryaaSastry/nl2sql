@@ -7,11 +7,11 @@ dotenv.config();
 function trimSchema(query, config) {
   const { schema, relations } = config;
   const queryLower = query.toLowerCase();
-  
+
   // 1. Simple keyword matching for tables
   const tables = Object.keys(schema);
   const relevantTables = new Set();
-  
+
   tables.forEach(table => {
     // If table name is in query
     if (queryLower.includes(table.toLowerCase().replace(/_/g, " "))) {
@@ -42,7 +42,7 @@ function trimSchema(query, config) {
   // 4. Construct trimmed config
   const trimmedSchema = {};
   const trimmedRelations = {};
-  
+
   expandedTables.forEach(table => {
     if (schema[table]) {
       trimmedSchema[table] = schema[table];
@@ -88,9 +88,10 @@ function buildSystemPrompt(config, query) {
     "8. JOINS: In the 'joins' array, include ONLY the names of tables to join with the primary 'table'. DO NOT repeat the primary 'table' name in the 'joins' array. Do not create self-joins unless explicitly required.",
     "9. NO CLARIFICATION: Never ask the user where data is stored or for a file upload. Use the provided schema and tools.",
     "10. DISTINCT: Set 'distinct: true' if the user asks for unique or distinct values.",
-    "11. AGGREGATIONS: Support SUM, AVG, COUNT, MIN, MAX and 'COUNT_DISTINCT' (for unique counts).",
+    "11. AGGREGATIONS: Support SUM, AVG, COUNT, COUNT_DISTINCT, MIN, and MAX.",
     "12. DATES: For relative dates (e.g. 'last 30 days', 'today'), use PostgreSQL syntax in the 'value' field (e.g. \"NOW() - INTERVAL '30 days'\").",
-    `13. CURRENT DATE: Today is ${new Date().toISOString().split('T')[0]}.`,
+    "13. INTERACTIVE VISUALS: If a query involves grouping and counts (e.g., 'by factory'), always include the category name and the numeric value in the 'columns' list. The server will proactively recommend a chart if appropriate.",
+    `14. CURRENT DATE: Today is ${new Date().toISOString().split('T')[0]}.`,
     "",
     "Schema:",
     tables,
@@ -104,7 +105,7 @@ function buildSystemPrompt(config, query) {
         table: "primaryTable",
         columns: ["table1.col1", "table2.col2"],
         filters: [{ column: "table.col", operator: "=", value: "val" }],
-        aggregations: [{ type: "SUM|AVG|COUNT|COUNT_DISTINCT", column: "table.col", alias: "alias" }],
+        aggregations: [{ type: "SUM|AVG|COUNT|COUNT_DISTINCT|MIN|MAX", column: "table.col", alias: "alias" }],
         groupBy: ["table.col1", "table.col2"],
         orderBy: { column: "alias_or_col", direction: "DESC|ASC" },
         limit: 10,
@@ -142,7 +143,7 @@ function extractJson(text) {
 function buildBody(query, systemText, useSystem) {
   const model = process.env.GEMINI_MODEL || DEFAULT_MODEL;
   const userText = useSystem ? query : `${systemText}\n\nUser request: ${query}`;
-  
+
   const body = {
     contents: [{ role: "user", parts: [{ text: userText }] }],
     generationConfig: {
@@ -157,8 +158,59 @@ function buildBody(query, systemText, useSystem) {
       parts: [{ text: systemText }]
     };
   }
-  
+
   return body;
+}
+
+export async function analyzeResults(query, results, config) {
+  const apiKey = process.env.GEMINI_API_KEY;
+  if (!apiKey || results.length === 0) return null;
+
+  const model = process.env.GEMINI_MODEL || DEFAULT_MODEL;
+  const isGemma = model.toLowerCase().includes("gemma");
+  
+  const systemPrompt = `
+    Role: Senior Data Analyst.
+    Task: Analyze the provided database results and write a professional report.
+    
+    Structure:
+    1. Executive Summary: 1-2 sentences answering the user's question directly.
+    2. Key Insights: 3-4 bullet points highlighting trends, anomalies, or important facts.
+    3. Recommendations: What should the user do next based on this data?
+    4. Follow-up: 2 suggested questions the user might want to ask next.
+
+    Rules:
+    - Be concise and professional.
+    - If there are outliers, point them out.
+    - Use a confident, analytical tone.
+    - Keep the response under 250 words.
+  `;
+
+  const userPrompt = `
+    User Question: "${query}"
+    Database Results: ${JSON.stringify(results.slice(0, 20))}
+    
+    Please provide the analytical report.
+  `;
+
+  const body = buildBody(userPrompt, systemPrompt, !isGemma);
+  const url = `https://generativelanguage.googleapis.com/v1beta/models/${model}:generateContent?key=${apiKey}`;
+
+  try {
+    const response = await fetch(url, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify(body),
+    });
+
+    if (!response.ok) return null;
+
+    const result = await response.json();
+    return result.candidates[0].content.parts[0].text;
+  } catch (e) {
+    console.error("Analyst Layer failed:", e);
+    return null;
+  }
 }
 
 export async function callLLM(query, config) {
@@ -174,7 +226,7 @@ export async function callLLM(query, config) {
 
   const systemText = buildSystemPrompt(config, query);
   const body = buildBody(query, systemText, useSystem);
-  
+
   console.error(`DEBUG: Using model ${model}, useSystem=${useSystem}`);
   console.error(`DEBUG: Request Body Keys: ${Object.keys(body).join(", ")}`);
 
@@ -193,7 +245,7 @@ export async function callLLM(query, config) {
 
   const result = await response.json();
   const text = result.candidates[0].content.parts[0].text;
-  
+
   try {
     const jsonStr = extractJson(text);
     return JSON.parse(jsonStr);
