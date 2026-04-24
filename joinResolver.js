@@ -1,12 +1,11 @@
-import { relations } from "./planConfig.js";
-
 /**
  * Finds the shortest join path between a base table and a goal table using BFS.
  * @param {string} start - The initial table
  * @param {string} target - The table to reach
+ * @param {object} relations - The relations config
  * @returns {string[]} Ordered array of table names in the join path (excluding the start table)
  */
-export function findJoinPath(start, target) {
+export function findJoinPath(start, target, relations) {
   if (start === target) return [];
 
   // queue stores [currentTable, currentPath]
@@ -36,11 +35,11 @@ export function findJoinPath(start, target) {
  * Expands a simple list of "requested" joins into a full transitive path.
  * e.g., if target is 'plans' and it joins only via 'customers', returns ['customers', 'plans'].
  */
-export function resolveAllJoins(baseTable, requestedJoins) {
+export function resolveAllJoins(baseTable, requestedJoins, relations) {
   const fullPathSet = new Set();
   
   for (const target of requestedJoins) {
-    const path = findJoinPath(baseTable, target);
+    const path = findJoinPath(baseTable, target, relations);
     path.forEach(t => fullPathSet.add(t));
   }
   

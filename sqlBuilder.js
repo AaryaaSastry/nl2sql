@@ -1,11 +1,10 @@
-import { MAX_LIMIT, relations } from "./planConfig.js";
 import { findJoinPath } from "./joinResolver.js";
 
 /**
  * Generates SQL from a structured plan.
  * Returns { sql, params }
  */
-export function buildSQL(plan) {
+export function buildSQL(plan, config) {
   const {
     table,
     columns = [],
@@ -14,8 +13,12 @@ export function buildSQL(plan) {
     joins = [],
     groupBy = [],
     orderBy,
-    limit = MAX_LIMIT
+    limit,
+    distinct = false
   } = plan;
+
+  const MAX_LIMIT = config?.MAX_LIMIT || 50;
+  const relations = config?.relations || {};
 
   const selectParts = [];
   const params = [];
@@ -26,22 +29,29 @@ export function buildSQL(plan) {
 
   for (const agg of aggregations) {
     const aggAlias = agg.alias || `${agg.type.toLowerCase().replace(/\./g, '_')}_${agg.column.replace(/\./g, '_')}`;
-    selectParts.push(`COALESCE(${agg.type}(${agg.column}), 0) AS ${aggAlias}`);
+    const aggType = agg.type.toUpperCase();
+    
+    if (aggType === "COUNT_DISTINCT") {
+      selectParts.push(`COUNT(DISTINCT ${agg.column}) AS ${aggAlias}`);
+    } else {
+      selectParts.push(`COALESCE(${aggType}(${agg.column}), 0) AS ${aggAlias}`);
+    }
   }
 
-  const selectClause = selectParts.length ? selectParts.join(", ") : "*";
+  let selectClause = selectParts.length ? selectParts.join(", ") : "*";
+  if (distinct) {
+    selectClause = `DISTINCT ${selectClause}`;
+  }
 
   let joinClause = "";
   if (joins.length > 0) {
-    // Current simple resolver: supports single-hop joins to the primary table
     const fullPathStrings = [];
     const visited = new Set();
     
-    // Process each target table join separately to find its path from our base table
     for (const joinTarget of joins) {
       if (visited.has(joinTarget)) continue;
 
-      const path = findJoinPath(table, joinTarget);
+      const path = findJoinPath(table, joinTarget, relations);
       
       let prevTable = table;
       for (const nextTable of path) {
@@ -62,27 +72,48 @@ export function buildSQL(plan) {
   let whereClause = "";
   if (filters.length > 0) {
     const filterStrings = filters.map((f, i) => {
-      params.push(f.value);
-      // PostgreSQL parameters follow $1, $2, etc.
-      return `${f.column} ${f.operator} $${params.length}`;
+      const val = String(f.value);
+      // Check if value looks like a PostgreSQL expression (NOW(), INTERVAL, etc.)
+      const isSqlExpression = /^(NOW\(\)|CURRENT_DATE|INTERVAL\s+)/i.test(val) || val.includes("INTERVAL");
+      
+      if (isSqlExpression) {
+        // Direct injection (sanitized) for SQL expressions
+        // Only allow specific safe words to prevent full SQL injection
+        const safeRegex = /^[A-Z0-9()., '\-]+$/i;
+        if (!safeRegex.test(val)) {
+            throw new Error(`Unsafe SQL expression in filter: ${val}`);
+        }
+        return `${f.column} ${f.operator} ${val}`;
+      } else {
+        // Standard parameterization
+        params.push(f.value);
+        return `${f.column} ${f.operator} $${params.length}`;
+      }
     });
     whereClause = `WHERE ${filterStrings.join(" AND ")}`;
   }
 
-  const groupByClause = groupBy.length > 0 ? `GROUP BY ${groupBy.join(", ")}` : "";
-
-  let orderByClause = "";
-  if (orderBy) {
-    orderByClause = `ORDER BY ${orderBy.column} ${orderBy.direction}`;
+  // Automatic GROUP BY for non-aggregated columns if aggregations are present
+  let finalGroupBy = [...groupBy];
+  if (aggregations.length > 0) {
+    for (const col of columns) {
+      if (!finalGroupBy.includes(col)) {
+        finalGroupBy.push(col);
+      }
+    }
   }
 
-  const safeLimit = Math.min(limit, MAX_LIMIT);
+  const groupByClause = finalGroupBy.length > 0 ? `GROUP BY ${finalGroupBy.join(", ")}` : "";
+
+  let orderByClause = "";
+  if (orderBy && orderBy.column) {
+    orderByClause = `ORDER BY ${orderBy.column} ${orderBy.direction || "ASC"}`;
+  }
+
+  const safeLimit = Math.min(limit || 10, MAX_LIMIT);
   const limitClause = `LIMIT ${safeLimit}`;
 
-  const sql = `SELECT ${selectClause} FROM ${table} ${joinClause} ${whereClause} ${groupByClause} ${orderByClause} ${limitClause};`;
+  const sql = `SELECT ${selectClause} FROM ${table} ${joinClause} ${whereClause} ${groupByClause} ${orderByClause} ${limitClause};`.replace(/\s+/g, " ").trim();
 
-  return { 
-    sql: sql.replace(/\s+/g, " ").trim(),
-    params 
-  };
+  return { sql, params };
 }

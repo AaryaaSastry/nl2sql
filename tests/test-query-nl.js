@@ -1,3 +1,5 @@
+import { fileURLToPath } from "url";
+import path from "path";
 import dotenv from 'dotenv';
 import { callLLM } from './llm.js';
 import { validatePlan } from './validator.js';
@@ -5,7 +7,7 @@ import { buildSQL } from './sqlBuilder.js';
 import { ensureSqlSafety } from './safety.js';
 import { supabase } from './db.js';
 
-dotenv.config();
+dotenv.config({ path: path.join(path.dirname(fileURLToPath(import.meta.url)), "../.env") });
 
 /**
  * Mocks the logic within query_nl to detect where it fails.
