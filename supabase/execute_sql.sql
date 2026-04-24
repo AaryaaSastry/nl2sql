@@ -1,31 +1,30 @@
--- Read-only SQL executor for Phase 2.
--- This function accepts a SQL string and executes it if it is a SELECT.
+-- Read-only SQL executor for Universal DB MCP.
+-- This function accepts a SQL string and executes it if it is a SELECT statement.
 
-create or replace function public.execute_sql(sql text)
-returns jsonb
-language plpgsql
-security definer
-as $$
-declare
+CREATE OR REPLACE FUNCTION public.execute_sql(sql text)
+RETURNS jsonb
+LANGUAGE plpgsql
+SECURITY DEFINER
+AS $$
+DECLARE
   result jsonb;
-begin
-  if sql is null or length(trim(sql)) = 0 then
-    raise exception 'SQL is required';
-  end if;
+BEGIN
+  IF sql IS NULL OR length(trim(sql)) = 0 THEN
+    RAISE EXCEPTION 'SQL is required';
+  END IF;
 
-  sql := regexp_replace(sql, ';\s*$', '');
+  -- Security: Basic check to ensure only SELECT statements are run
+  IF lower(ltrim(sql)) NOT LIKE 'select %' THEN
+    RAISE EXCEPTION 'Only SELECT statements are allowed';
+  END IF;
 
-  if lower(ltrim(sql)) not like 'select %' then
-    raise exception 'Only SELECT statements are allowed';
-  end if;
+  EXECUTE format('SELECT coalesce(jsonb_agg(t), ''[]''::jsonb) FROM (%s) t', sql)
+    INTO result;
 
-  execute format('select coalesce(jsonb_agg(t), ''[]''::jsonb) from (%s) t', sql)
-    into result;
-
-  return result;
-end;
+  RETURN result;
+END;
 $$;
 
-revoke all on function public.execute_sql(text) from public;
-
-grant execute on function public.execute_sql(text) to anon, authenticated;
+-- Permissions management
+REVOKE ALL ON FUNCTION public.execute_sql(text) FROM public;
+GRANT EXECUTE ON FUNCTION public.execute_sql(text) TO anon, authenticated, service_role;

@@ -1,6 +1,6 @@
 {
   "name": "telecom-mcp",
-  "version": "1.0.0",
+  "version": "1.2.0",
   "description": "MCP server for Supabase-backed telecom data",
   "type": "module",
   "main": "index.js",

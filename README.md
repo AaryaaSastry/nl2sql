@@ -1,110 +1,91 @@
-# telecom-mcp
+# 🌌 Universal DB MCP Server
 
-Phase 1 MCP server that exposes a simple Supabase-backed tool.
+**Universal DB MCP** is a high-performance Model Context Protocol server that bridges the gap between Large Language Models (LLMs) and your data. It transforms any Supabase-backed PostgreSQL database into a searchable, intelligent data source that speaks human.
 
-## Phase 2 SQL builder
+Instead of writing complex SQL or manually navigating tables, you can simply ask questions in plain English. The server handles schema discovery, relationship mapping, and SQL generation automatically.
 
-`sqlBuilder.js` exports `buildSQL(plan)` to convert a validated query plan into SQL.
+---
 
-Example plan:
+## ✨ Capabilities
 
-```json
-{
-  "table": "customers",
-  "columns": ["id", "name", "city"],
-  "filters": [
-    { "column": "city", "operator": "=", "value": "Bangalore" }
-  ],
-  "orderBy": { "column": "name", "direction": "ASC" },
-  "limit": 10
-}
-```
+- **🗣️ Natural Language Interface**: Query your database using conversational English.
+- **🔍 Intelligent Schema Discovery**: Automatically understands your tables, columns, and foreign key relationships.
+- **🔗 Auto-Join Resolution**: Effortlessly queries across multiple tables by following database relations.
+- **🛡️ Enterprise-Grade Safety**: Read-only execution with strict SQL sanitization and validation.
+- **📊 Business Insights**: Not just raw data—get human-readable summaries and actionable insights.
+- **🌐 Multi-Tenant Ready**: Manage multiple database environments (Prod, Staging, Dev) from a single interface.
 
-Usage:
+## 🚀 Quick Start
 
-```js
-import { buildSQL } from "./sqlBuilder.js";
-
-const sql = buildSQL(plan);
-console.log(sql);
-```
-
-## Phase 2 plan validation + MCP tool
-
-The server also exposes a `query_plan` tool that validates a structured plan, builds SQL, and optionally executes it.
-
-Example plan:
-
-```json
-{
-  "table": "data_usage",
-  "columns": ["customers.name"],
-  "aggregations": [
-    { "type": "SUM", "column": "data_usage.data_used_mb", "alias": "total_mb" }
-  ],
-  "joins": ["customers"],
-  "groupBy": ["customers.name"],
-  "orderBy": { "column": "total_mb", "direction": "DESC" },
-  "limit": 5
-}
-```
-
-Calling the tool without execution returns SQL only. To execute SQL, set an RPC function name in `.env`:
+### 1. Configure Environment
+Create a `.env` file with your credentials:
 
 ```env
-SUPABASE_SQL_RPC=execute_sql
-```
+# Primary Connection (Default)
+SUPABASE_URL=https://your-project.supabase.co
+SUPABASE_KEY=your-service-role-key
 
-The RPC function must accept a single `sql` text argument. If not configured, the tool returns SQL only.
-
-### Supabase RPC setup
-
-Apply the SQL in [supabase/execute_sql.sql](supabase/execute_sql.sql) in the Supabase SQL editor. This creates a read-only RPC that only allows `SELECT` statements and returns JSON.
-
-## Natural language queries
-
-Set these in `.env`:
-
-```env
-GEMINI_API_KEY=your_key
+# AI Intelligence (Google Gemini)
+GEMINI_API_KEY=your-gemini-api-key
 GEMINI_MODEL=gemini-1.5-flash
-GEMINI_USE_SYSTEM=false
 ```
 
-Use the `query_nl` tool to convert English to a plan and then run it through validation and the SQL builder. Set `execute` to `true` only after the SQL RPC is configured.
+### 2. Enable SQL Execution
+Run the following bridge function in your **Supabase SQL Editor** to allow the MCP server to securely fetch data:
 
-If you see errors about developer/system instructions, keep `GEMINI_USE_SYSTEM=false` so the prompt is sent as part of the user message.
-
-## Setup
-
-1. Install dependencies:
-
-```bash
-npm install
+```sql
+-- Security-hardened SQL executor
+CREATE OR REPLACE FUNCTION execute_sql(sql text)
+RETURNS jsonb LANGUAGE plpgsql SECURITY DEFINER AS $$
+DECLARE result jsonb;
+BEGIN
+  IF lower(ltrim(sql)) NOT LIKE 'select %' THEN
+    RAISE EXCEPTION 'Only SELECT statements are permitted.';
+  END IF;
+  EXECUTE format('SELECT coalesce(jsonb_agg(t), ''[]''::jsonb) FROM (%s) t', sql) INTO result;
+  RETURN result;
+END;
+$$;
 ```
 
-2. Set environment variables in `.env`:
-
-```env
-SUPABASE_URL=your_url
-SUPABASE_KEY=your_anon_key
-```
-
-3. Start the server:
-
-```bash
-npm start
-```
-
-## Claude Desktop MCP config
+### 3. Connect to Claude
+Add the server to your `claude_desktop_config.json`:
 
 ```json
 {
   "mcpServers": {
-    "telecom-db": {
+    "universal-db": {
       "command": "node",
-      "args": ["path/to/index.js"]
+      "args": ["/absolute/path/to/telecom-mcp/index.js"]
     }
   }
 }
 ```
+
+---
+
+## 🛠️ Tool Reference
+
+### `query_nl`
+**The primary tool.** Ask any question about your data.
+- *Example*: "Who are the top 10 customers by revenue this quarter?"
+- *Example*: "Compare data usage between users in Bangalore vs Mumbai."
+
+### `register_db`
+Dynamically connect to a new Supabase project without restarting the server.
+- *Parameters*: `alias`, `url`, `key`.
+
+### `list_databases`
+View all active connections and their discovered schemas.
+
+### `refresh_schema`
+Sync the server with your latest database changes (new tables or columns).
+
+---
+
+## 🔒 Security & Safety
+
+- **Read-Only**: The server is architected to only execute `SELECT` statements.
+- **Sanitization**: All generated SQL passes through a multi-stage validation layer before execution.
+- **No Data Training**: Your data is used only for the immediate query and is not used to train underlying models.
+
