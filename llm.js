@@ -1,67 +1,107 @@
 import dotenv from "dotenv";
 
-const DEFAULT_MODEL = "gemini-2.0-flash-exp";
+const DEFAULT_MODEL = "gemini-2.0-flash";
+const DEFAULT_TIMEOUT = 30000; // 30 seconds
 
 dotenv.config();
 
+/**
+ * Utility for robust API fetching with retries and timeouts
+ */
+async function fetchWithRetry(url, options, maxRetries = 3) {
+  let lastError;
+  const controller = new AbortController();
+  const timeoutId = setTimeout(() => controller.abort(), DEFAULT_TIMEOUT);
+
+  for (let i = 0; i < maxRetries; i++) {
+    try {
+      const response = await fetch(url, { 
+        ...options, 
+        signal: controller.signal 
+      });
+
+      if (response.status === 429 || response.status >= 500) {
+        const delay = Math.pow(2, i) * 1000;
+        console.error(`[LLM] API Error ${response.status}. Retrying in ${delay}ms...`);
+        await new Promise(r => setTimeout(r, delay));
+        continue;
+      }
+
+      const result = await response.json();
+      
+      // Check for Gemini internal errors
+      if (result.error) {
+        throw new Error(`Gemini API Error: ${result.error.message} (${result.error.status})`);
+      }
+
+      clearTimeout(timeoutId);
+      return result;
+    } catch (e) {
+      lastError = e;
+      if (e.name === 'AbortError') throw new Error(`LLM Request timed out after ${DEFAULT_TIMEOUT}ms`);
+      if (i === maxRetries - 1) break;
+      await new Promise(r => setTimeout(r, 1000));
+    }
+  }
+  
+  clearTimeout(timeoutId);
+  throw lastError;
+}
+
+/**
+ * Validates the project configuration
+ */
+function validateConfig(config) {
+  if (!config || !config.schema) throw new Error("Invalid Config: Missing database schema.");
+  if (!process.env.GEMINI_API_KEY) throw new Error("Missing GEMINI_API_KEY in .env");
+  return true;
+}
+
+/**
+ * Intelligently trims the schema to relevant tables to save tokens
+ */
 function trimSchema(query, config) {
   const { schema, relations } = config;
   const queryLower = query.toLowerCase();
-
-  // 1. Simple keyword matching for tables
   const tables = Object.keys(schema);
   const relevantTables = new Set();
 
   tables.forEach(table => {
-    // If table name is in query
-    if (queryLower.includes(table.toLowerCase().replace(/_/g, " "))) {
-      relevantTables.add(table);
-    }
-    // If table name (singular/plural) is in query
-    const singular = table.endsWith("s") ? table.slice(0, -1) : table;
-    if (queryLower.includes(singular.toLowerCase())) {
+    const tableLower = table.toLowerCase();
+    const singular = tableLower.endsWith("s") ? tableLower.slice(0, -1) : tableLower;
+    const plural = tableLower.endsWith("s") ? tableLower : tableLower + "s";
+    
+    if (queryLower.includes(tableLower) || queryLower.includes(singular) || queryLower.includes(plural)) {
       relevantTables.add(table);
     }
   });
 
-  // 2. If no tables found, use all (small schema) or top 10 (large schema)
+  // If no tables found, fallback to top 15 tables instead of entire DB
   if (relevantTables.size === 0) {
     if (tables.length <= 15) return config;
-    // For large schemas, we'd need better logic, but for now take all to be safe
-    return config;
+    return { ...config, schema: Object.fromEntries(Object.entries(schema).slice(0, 15)) };
   }
 
-  // 3. Add 1-hop related tables to allow for joins
+  // 1-hop expansion for joins
   const expandedTables = new Set(relevantTables);
   relevantTables.forEach(table => {
     if (relations[table]) {
-      Object.keys(relations[table]).forEach(related => expandedTables.add(related));
+      Object.keys(relations[table]).forEach(related => {
+        if (schema[related]) expandedTables.add(related);
+      });
     }
   });
-
-  // 4. Construct trimmed config
-  const trimmedSchema = {};
-  const trimmedRelations = {};
-
-  expandedTables.forEach(table => {
-    if (schema[table]) {
-      trimmedSchema[table] = schema[table];
-      trimmedRelations[table] = relations[table] || {};
-    }
-  });
-
-  console.error(`[LLM] Trimmed schema from ${tables.length} to ${expandedTables.size} tables for query: "${query}"`);
 
   return {
     ...config,
-    schema: trimmedSchema,
-    relations: trimmedRelations
+    schema: Object.fromEntries(Object.entries(schema).filter(([k]) => expandedTables.has(k))),
+    relations: Object.fromEntries(Object.entries(relations).filter(([k]) => expandedTables.has(k)))
   };
 }
 
-function buildSystemPrompt(config, query) {
-  const trimmedConfig = query ? trimSchema(query, config) : config;
-  const { schema, relations, MAX_LIMIT } = trimmedConfig;
+function buildSystemPrompt(config) {
+  const { schema, relations, MAX_LIMIT = 50 } = config;
+  
   const tables = Object.entries(schema)
     .map(([table, columns]) => `${table}(${columns.join(", ")})`)
     .join("\n");
@@ -79,19 +119,15 @@ function buildSystemPrompt(config, query) {
     "Goal: Convert natural language into a structured JSON query plan.",
     "",
     "CRITICAL RULES:",
-    "1. ONE QUERY, ONE TRUTH: Join all necessary tables into a single plan. Do not rely on multiple calls for a single insight.",
-    "2. NO HALLUCINATIONS: Use ONLY the provided schema. Do not invent columns like 'customer_name' or 'minutes'.",
-    "3. STICK TO FACTS: If the user asks for 'active' or 'overdue', and there is no 'is_active' or 'is_overdue' column, filter by available columns (e.g., status='unpaid').",
-    "4. AGGREGATION: If metrics from multiple tables are requested, group by the primary entity (e.g. table.id or table.name).",
-    "5. FORMAT: Return ONLY the JSON object. No prose. No markdown unless wrapped in ```json.",
-    "7. LIMIT: Always include a limit (default: 10, max: ${MAX_LIMIT}).",
-    "8. JOINS: In the 'joins' array, include ONLY the names of tables to join with the primary 'table'. DO NOT repeat the primary 'table' name in the 'joins' array. Do not create self-joins unless explicitly required.",
-    "9. NO CLARIFICATION: Never ask the user where data is stored or for a file upload. Use the provided schema and tools.",
-    "10. DISTINCT: Set 'distinct: true' if the user asks for unique or distinct values.",
-    "11. AGGREGATIONS: Support SUM, AVG, COUNT, COUNT_DISTINCT, MIN, and MAX.",
-    "12. DATES: For relative dates (e.g. 'last 30 days', 'today'), use PostgreSQL syntax in the 'value' field (e.g. \"NOW() - INTERVAL '30 days'\").",
-    "13. INTERACTIVE VISUALS: If a query involves grouping and counts (e.g., 'by factory'), always include the category name and the numeric value in the 'columns' list. The server will proactively recommend a chart if appropriate.",
-    `14. CURRENT DATE: Today is ${new Date().toISOString().split('T')[0]}.`,
+    "1. ONE QUERY, ONE TRUTH: Join all necessary tables into a single plan.",
+    "2. NO HALLUCINATIONS: Use ONLY the provided schema. Do not invent columns.",
+    "3. AGGREGATIONS: Support SUM, AVG, COUNT, COUNT_DISTINCT, MIN, and MAX.",
+    "4. FORMAT: Return ONLY the JSON object. No prose. No markdown unless wrapped in ```json.",
+    `5. LIMIT: Always include a limit (default: 10, max: ${MAX_LIMIT}).`,
+    "6. COLUMN NAMES: Use 'table.column' format.",
+    "7. AGGREGATIONS ONLY: All calculations MUST go into the 'aggregations' array.",
+    "8. GROUP BY REQUIREMENT: Use 'groupBy' ONLY when 'aggregations' are present.",
+    `9. CURRENT DATE: Today is ${new Date().toISOString().split('T')[0]}.`,
     "",
     "Schema:",
     tables,
@@ -99,55 +135,61 @@ function buildSystemPrompt(config, query) {
     "Joins:",
     joinLines || "(none)",
     "",
-    "Required Plan Structure:",
-    JSON.stringify(
-      {
-        table: "primaryTable",
-        columns: ["table1.col1", "table2.col2"],
-        filters: [{ column: "table.col", operator: "=", value: "val" }],
-        aggregations: [{ type: "SUM|AVG|COUNT|COUNT_DISTINCT|MIN|MAX", column: "table.col", alias: "alias" }],
-        groupBy: ["table.col1", "table.col2"],
-        orderBy: { column: "alias_or_col", direction: "DESC|ASC" },
-        limit: 10,
-        joins: ["table2", "table3"],
-        distinct: false
-      },
-      null,
-      2
-    )
+    "Example Output:",
+    JSON.stringify({
+      table: "primaryTable",
+      columns: ["table1.col1"],
+      filters: [{ column: "table.col", operator: "=", value: "val" }],
+      aggregations: [{ type: "SUM", column: "table.col", alias: "total" }],
+      groupBy: ["table.col"],
+      limit: 10,
+      joins: ["table2"]
+    }, null, 2)
   ].join("\n");
 }
 
 function extractJson(text) {
   const trimmed = text.trim();
-  console.error("DEBUG: LLM content to parse:", trimmed);
+  
+  // Try clean JSON first
+  try {
+    if (trimmed.startsWith("{") && trimmed.endsWith("}")) {
+      JSON.parse(trimmed);
+      return trimmed;
+    }
+  } catch (e) {}
 
-  if (trimmed.startsWith("{") && trimmed.endsWith("}")) {
-    return trimmed;
-  }
-
+  // Try fenced blocks
   const fencedMatch = trimmed.match(/```(?:json)?\s*([\s\S]*?)\s*```/i);
   if (fencedMatch) {
-    return fencedMatch[1].trim();
+    const extracted = fencedMatch[1].trim();
+    try {
+      JSON.parse(extracted);
+      return extracted;
+    } catch (e) {}
   }
 
+  // Final fallback: find braces
   const firstBrace = trimmed.indexOf("{");
   const lastBrace = trimmed.lastIndexOf("}");
   if (firstBrace !== -1 && lastBrace !== -1 && lastBrace > firstBrace) {
-    return trimmed.slice(firstBrace, lastBrace + 1);
+    const slice = trimmed.slice(firstBrace, lastBrace + 1);
+    try {
+      JSON.parse(slice);
+      return slice;
+    } catch (e) {}
   }
 
-  return trimmed;
+  throw new Error("Failed to extract valid JSON from LLM response.");
 }
 
-function buildBody(query, systemText, useSystem) {
-  const model = process.env.GEMINI_MODEL || DEFAULT_MODEL;
+function buildBody(query, systemText, useSystem, maxTokens = 800) {
   const userText = useSystem ? query : `${systemText}\n\nUser request: ${query}`;
 
   const body = {
     contents: [{ role: "user", parts: [{ text: userText }] }],
     generationConfig: {
-      maxOutputTokens: 800,
+      maxOutputTokens: maxTokens,
       temperature: 0
     }
   };
@@ -162,94 +204,107 @@ function buildBody(query, systemText, useSystem) {
   return body;
 }
 
+/**
+ * Analyst Layer: Generates strategic reports from data
+ */
 export async function analyzeResults(query, results, config) {
-  const apiKey = process.env.GEMINI_API_KEY;
-  if (!apiKey || results.length === 0) return null;
-
-  const model = process.env.GEMINI_MODEL || DEFAULT_MODEL;
-  const isGemma = model.toLowerCase().includes("gemma");
+  if (!Array.isArray(results) || results.length === 0) return null;
   
-  const systemPrompt = `
-    Role: Senior Data Analyst.
-    Task: Analyze the provided database results and write a professional report.
-    
-    Structure:
-    1. Executive Summary: 1-2 sentences answering the user's question directly.
-    2. Key Insights: 3-4 bullet points highlighting trends, anomalies, or important facts.
-    3. Recommendations: What should the user do next based on this data?
-    4. Follow-up: 2 suggested questions the user might want to ask next.
-
-    Rules:
-    - Be concise and professional.
-    - If there are outliers, point them out.
-    - Use a confident, analytical tone.
-    - Keep the response under 250 words.
-  `;
-
-  const userPrompt = `
-    User Question: "${query}"
-    Database Results: ${JSON.stringify(results.slice(0, 20))}
-    
-    Please provide the analytical report.
-  `;
-
-  const body = buildBody(userPrompt, systemPrompt, !isGemma);
-  const url = `https://generativelanguage.googleapis.com/v1beta/models/${model}:generateContent?key=${apiKey}`;
-
   try {
-    const response = await fetch(url, {
+    validateConfig(config);
+    const apiKey = process.env.GEMINI_API_KEY;
+    const model = process.env.GEMINI_MODEL || DEFAULT_MODEL;
+    const isGemma = model.toLowerCase().includes("gemma");
+
+    const systemPrompt = `
+      Role: Senior Strategic Data Analyst & Visualization Expert.
+      Task: Analyze results and create a COMPREHENSIVE visualization suite and executive report.
+      
+      Structure:
+      1. 🚀 Introduction: Start EXACTLY with: "I'll create additional detailed charts for you. Let me load the visualization system: Now let me create comprehensive detailed charts: I've created a comprehensive suite of detailed charts analyzing your database:"
+      2. 📊 Visualization Suite: Create 4-8 DETAILED CHARTS. 
+      
+      FORMATTING RULE (CRITICAL):
+      Each chart MUST be wrapped in \`\`\`chartjs code fences.
+      Example:
+      \`\`\`chartjs
+      {
+        "type": "pie",
+        "data": {
+          "labels": ["A", "B"],
+          "datasets": [{
+            "data": [10, 20],
+            "backgroundColor": ["#3b82f6", "#10b981"]
+          }]
+        },
+        "title": "Sample Chart"
+      }
+      \`\`\`
+
+      CRITICAL RULES FOR CHARTS:
+      - NEVER place chart JSON outside a \`\`\`chartjs block.
+      - NEVER mix explanation text inside the code block.
+      - VALID JSON ONLY: Triple-check for unclosed quotes (e.g., "#3b82f6" NOT "#3b82f6]).
+      - DATA: ALWAYS populate labels and data arrays with ACTUAL values from results.
+      - TYPES: Use ONLY "pie", "bar", "line", or "doughnut".
+      - Generate ONLY ONE code block per visualization.
+      - Use professional palettes: ['#3b82f6', '#10b981', '#f59e0b', '#ef4444', '#8b5cf6'].
+
+      3. 🧠 Strategic Insights: 3-5 deep business insights.
+      4. 📈 Summary Statistics: Totals and counts at the bottom.
+    `;
+
+    const userPrompt = `
+      User Question: "${query}"
+      Database Results (Limited to top 100): ${JSON.stringify(results.slice(0, 100))}
+    `;
+
+    const body = buildBody(userPrompt, systemPrompt, !isGemma, 2500);
+    const url = `https://generativelanguage.googleapis.com/v1beta/models/${model}:generateContent?key=${apiKey}`;
+
+    const result = await fetchWithRetry(url, {
       method: "POST",
       headers: { "Content-Type": "application/json" },
-      body: JSON.stringify(body),
+      body: JSON.stringify(body)
     });
 
-    if (!response.ok) return null;
-
-    const result = await response.json();
     return result.candidates[0].content.parts[0].text;
   } catch (e) {
-    console.error("Analyst Layer failed:", e);
+    console.error("[LLM] Analyst Layer failed:", e.message);
     return null;
   }
 }
 
+/**
+ * Planner Layer: Generates SQL Query Plan from Natural Language
+ */
 export async function callLLM(query, config) {
-  const apiKey = process.env.GEMINI_API_KEY;
-  if (!apiKey) {
-    throw new Error("GEMINI_API_KEY not found in .env");
-  }
-
-  // Detect model type - Gemma does not support system instructions
+  validateConfig(config);
+  
   const model = process.env.GEMINI_MODEL || DEFAULT_MODEL;
   const isGemma = model.toLowerCase().includes("gemma");
   const useSystem = isGemma ? false : (process.env.GEMINI_USE_SYSTEM === "true");
 
-  const systemText = buildSystemPrompt(config, query);
-  const body = buildBody(query, systemText, useSystem);
+  const trimmedConfig = trimSchema(query, config);
+  const systemText = buildSystemPrompt(trimmedConfig);
+  const body = buildBody(query, systemText, useSystem, 1000);
 
-  console.error(`DEBUG: Using model ${model}, useSystem=${useSystem}`);
-  console.error(`DEBUG: Request Body Keys: ${Object.keys(body).join(", ")}`);
-
+  const apiKey = process.env.GEMINI_API_KEY;
   const url = `https://generativelanguage.googleapis.com/v1beta/models/${model}:generateContent?key=${apiKey}`;
 
-  const response = await fetch(url, {
+  const result = await fetchWithRetry(url, {
     method: "POST",
     headers: { "Content-Type": "application/json" },
-    body: JSON.stringify(body),
+    body: JSON.stringify(body)
   });
 
-  if (!response.ok) {
-    const err = await response.text();
-    throw new Error(`LLM Error: ${response.status} - ${err}`);
-  }
-
-  const result = await response.json();
   const text = result.candidates[0].content.parts[0].text;
-
+  
   try {
     const jsonStr = extractJson(text);
     return JSON.parse(jsonStr);
   } catch (e) {
-    throw new Error(`Failed to parse LLM response as JSON: ${text}`);
+    console.error("[LLM] JSON Parsing failed. Raw response:", text);
+    throw new Error(`LLM generated invalid query plan: ${e.message}`);
   }
 }

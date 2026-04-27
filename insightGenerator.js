@@ -75,17 +75,6 @@ export function generateInsights(results, queryPrompt = "") {
     return "No records were found matching this criteria.";
   }
 
-  const visualType = detectVisualType(queryPrompt, results);
-  const userWantsVisual = queryPrompt.toLowerCase().includes("yes") || 
-                          queryPrompt.toLowerCase().includes("show") || 
-                          queryPrompt.toLowerCase().includes("chart") ||
-                          queryPrompt.toLowerCase().includes("graph");
-
-  const mermaidCode = (visualType && userWantsVisual) ? generateMermaid(visualType, results) : "";
-  const recommendation = (visualType && !userWantsVisual) 
-    ? `\n\n📊 **AI Recommendation:** This data would look great as a **${visualType.toUpperCase()} CHART**. Would you like me to generate it? (Reply "Yes" or "Show chart")`
-    : "";
-
   // Handle case where result is very large to avoid token overflow
   const maxResults = 50;
   const isTruncated = results.length > maxResults;
@@ -111,9 +100,7 @@ export function generateInsights(results, queryPrompt = "") {
     return `• ${details}`;
   });
 
-  let message = mermaidCode;
-  message += `\n**Detailed Summary (${results.length} records found):**\n\n${bulletPoints.join("\n")}`;
-  message += recommendation;
+  let message = `### 📄 Raw Data Records\n\n${bulletPoints.join("\n")}`;
   
   if (isTruncated) {
     message += `\n\n(Showing first ${maxResults} results. Use specific filters for more targeted data.)`;

@@ -1,5 +1,10 @@
 import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import { StdioServerTransport } from "@modelcontextprotocol/sdk/server/stdio.js";
+import { SSEServerTransport } from "@modelcontextprotocol/sdk/server/sse.js";
+import express from "express";
+import cors from "cors";
+import helmet from "helmet";
+import { rateLimit } from "express-rate-limit";
 import { z } from "zod";
 import dotenv from "dotenv";
 import path from "path";
@@ -10,6 +15,11 @@ const __dirname = path.dirname(fileURLToPath(import.meta.url));
 dotenv.config({ path: path.join(__dirname, ".env") });
 
 import { connectionManager } from "./connectionManager.js";
+import { 
+  generateVisualization, 
+  generateSummaryStats, 
+  formatStatsAsMarkdown 
+} from "./visualizationService.js";
 import { buildSQL } from "./sqlBuilder.js";
 import { validatePlan } from "./validator.js";
 import { callLLM, analyzeResults } from "./llm.js";
@@ -274,6 +284,146 @@ server.registerTool(
   }
 );
 
+/**
+ * Core logic for natural language queries, extracted for reuse in MCP and REST API.
+ */
+async function executeNaturalLanguageQuery(db, query) {
+  try {
+    // Step 0: Input validation
+    const MAX_QUERY_LENGTH = 500;
+    if (query.length > MAX_QUERY_LENGTH) {
+      throw new Error(`Query too long (${query.length} chars, max ${MAX_QUERY_LENGTH}). Please ask a more specific question.`);
+    }
+
+    const { supabase, config } = connectionManager.get(db);
+
+    // Step 1: Detect Meta Queries (Schema/DB Info)
+    const q = query.toLowerCase();
+    const metaKeywords = ["schema", "tables", "list all", "what is in", "db structure", "database structure"];
+    const isMetaQuery = metaKeywords.some(k => q.includes(k)) || 
+                        (q.includes("details") && (q.includes("db") || q.includes("database"))) ||
+                        (q.includes("info") && (q.includes("db") || q.includes("database")));
+
+    if (isMetaQuery) {
+      const tableCount = Object.keys(config.schema).length;
+      const schemaSummary = Object.entries(config.schema)
+        .map(([table, cols]) => {
+          const tableTypes = config.types && config.types[table] ? config.types[table] : {};
+          return `#### 📁 ${table}\n| Column | Type |\n| :--- | :--- |\n${cols.map(c => `| ${c} | *${tableTypes[c] || 'unknown'}* |`).join("\n")}`;
+        })
+        .join("\n\n");
+      
+      const suggestions = [
+        "Show me database relationships",
+        "Give me a summary of data in the largest table",
+        "Analyze high-priority entities"
+      ];
+
+      const text = `## 📊 Database Schema: ${db}\n` +
+                   `Discovered **${tableCount} tables** in the public schema.\n\n` +
+                   schemaSummary +
+                   `\n\n---\n### 💡 Recommended Questions\n` +
+                   suggestions.map(s => `* [${s}](query://${s})`).join("\n");
+      
+      return {
+        content: [{ type: "text", text }],
+        data: config.schema,
+        sql: "INTERNAL_METADATA_QUERY"
+      };
+    }
+
+    // --- Step 2 & 3: LLM to Plan & Execution (with Self-Healing Retry Loop) ---
+    let plan;
+    let validatedPlan;
+    let retryCount = 0;
+    const maxRetries = 2; // Allow 2 retries for self-healing
+    let lastError = null;
+
+    while (retryCount <= maxRetries) {
+      try {
+        // If we have a previous error, include it in the prompt for self-healing
+        const currentQuery = lastError 
+          ? `${query}\n\nPREVIOUS ATTEMPT FAILED WITH ERROR: "${lastError}"\nPlease fix the plan to resolve this database error.`
+          : query;
+
+        plan = await callLLM(currentQuery, config);
+        validatedPlan = validatePlan(plan, config);
+        
+        // Step 3: SQL Generation
+        const { sql: rawSql, params } = buildSQL(validatedPlan, config);
+        const sql = rawSql.trim().replace(/;+\s*$/, "");
+
+        // Step 4: Safety & Execution
+        ensureSqlSafety(sql);
+
+        const rpcName = process.env.SUPABASE_SQL_RPC || "execute_sql";
+        let { data, error } = await supabase.rpc(rpcName, { sql, params });
+
+        // Handle specific RPC argument mismatch fallback
+        if (error && (error.message.toLowerCase().includes("too many arguments") || error.message.toLowerCase().includes("could not find the function"))) {
+          let hydratedSql = sql;
+          if (params && params.length > 0) {
+            params.forEach((val, i) => {
+              const escaped = typeof val === 'string' ? `'${val.replace(/'/g, "''")}'` : (val === null ? 'NULL' : val);
+              const regex = new RegExp(`\\$${i + 1}(?![0-9])`, 'g');
+              hydratedSql = hydratedSql.replace(regex, escaped);
+            });
+          }
+          const retry = await supabase.rpc(rpcName, { sql: hydratedSql });
+          data = retry.data;
+          error = retry.error;
+        }
+
+        if (error) {
+          // This is where Self-Healing kicks in!
+          logger.warn("Database error detected, initiating self-healing retry", { error: error.message, retryCount });
+          lastError = error.message;
+          retryCount++;
+          continue; // Try again with the error context
+        }
+
+        // If we reached here, query was successful
+        data = Array.isArray(data) ? data : (data ? [data] : []);
+        
+        const insights = generateInsights(data, query);
+        const analystReport = await analyzeResults(query, data, config);
+        
+        // Standalone Visualization Service (Deterministic)
+        const autoChart = generateVisualization(query, data);
+        const autoStats = generateSummaryStats(data);
+        const autoStatsMd = autoStats ? formatStatsAsMarkdown(autoStats) : "";
+
+        let finalContent = analystReport || insights;
+        
+        // Prioritize the analyst report but ensure stats and charts are included
+        if (analystReport) {
+          finalContent = `${analystReport}\n\n${autoStatsMd}\n\n---\n### 📄 Raw Data Records\n${insights}`;
+        }
+
+        return {
+          content: [{ type: "text", text: finalContent }],
+          data: data,
+          sql: sql,
+          chart: autoChart
+        };
+
+      } catch (e) {
+        logger.warn("Query processing error, retrying", { error: e.message, retryCount });
+        lastError = e.message;
+        retryCount++;
+        if (retryCount > maxRetries) {
+          throw e; // Final failure after max retries
+        }
+      }
+    }
+  } catch (e) {
+    if (e instanceof McpError) {
+      throw e;
+    }
+    throw new Error(e.message);
+  }
+}
+
 server.registerTool(
   "query_nl",
   {
@@ -287,103 +437,8 @@ server.registerTool(
   },
   async ({ db, query }) => {
     try {
-      // Step 0: Input validation - reject long queries to prevent prompt injection and runaway costs
-      const MAX_QUERY_LENGTH = 500;
-      if (query.length > MAX_QUERY_LENGTH) {
-        return {
-          content: [{
-            type: "text",
-            text: `Query too long (${query.length} chars, max ${MAX_QUERY_LENGTH}). Please ask a more specific question.`
-          }],
-          isError: true
-        };
-      }
-
-      const { supabase, config } = connectionManager.get(db);
-
-      // Step 1: LLM to Plan (with retry logic)
-      let plan;
-      let validatedPlan;
-      let retryCount = 0;
-      const maxRetries = 1;
-
-      while (retryCount <= maxRetries) {
-        try {
-          plan = await callLLM(query, config);
-          validatedPlan = validatePlan(plan, config);
-          break; // Success
-        } catch (validationError) {
-          retryCount++;
-          if (retryCount > maxRetries) {
-            // Final failure
-            logger.error("Query validation failed after retries", validationError);
-            throw validationError;
-          }
-
-          // Retry: Feed error back to LLM
-          logger.warn("Query validation failed, retrying", { error: validationError.message, retryCount });
-          const correctionPrompt = `${query}\n\nPrevious attempt failed with: "${validationError.message}". Please look at the schema again and provide a corrected plan.`;
-          try {
-            plan = await callLLM(correctionPrompt, config);
-            validatedPlan = validatePlan(plan, config);
-            break;
-          } catch (e) {
-            // Still failed on retry
-            continue;
-          }
-        }
-      }
-
-      // Step 3: SQL
-      const { sql: rawSql, params } = buildSQL(validatedPlan, config);
-      const sql = rawSql.trim().replace(/;+\s*$/, "");
-
-      // Step 4: Safety & Execution
-      ensureSqlSafety(sql);
-
-      // Execute query
-      const rpcName = process.env.SUPABASE_SQL_RPC || "execute_sql";
-
-      let finalData;
-      let { data, error } = await supabase.rpc(rpcName, { sql, params });
-
-      if (error && (error.message.toLowerCase().includes("too many arguments") || error.message.toLowerCase().includes("could not find the function"))) {
-        // Fallback: Hydrate SQL locally for older RPCs that only accept a single 'sql' argument
-        let hydratedSql = sql;
-        if (params && params.length > 0) {
-          params.forEach((val, i) => {
-            const escaped = typeof val === 'string' ? `'${val.replace(/'/g, "''")}'` : (val === null ? 'NULL' : val);
-            const regex = new RegExp(`\\$${i + 1}(?![0-9])`, 'g');
-            hydratedSql = hydratedSql.replace(regex, escaped);
-          });
-        }
-
-        const retry = await supabase.rpc(rpcName, { sql: hydratedSql });
-        if (retry.error) {
-          logger.error("Hydrated fallback query failed", retry.error);
-          throw new Error(retry.error.message);
-        }
-        finalData = retry.data;
-      } else if (error) {
-        logger.error("RPC Query Failed", { error, sql, params });
-        throw new Error(error.message);
-      } else {
-        finalData = data;
-      }
-
-      const insights = generateInsights(finalData, query);
-      const analystReport = await analyzeResults(query, finalData, config);
-
-      let finalContent = insights;
-      if (analystReport) {
-        finalContent = `\n---\n### 🧠 AI Analyst Report\n${analystReport}\n\n---\n${insights}`;
-      }
-
-      return {
-        content: [
-          { type: "text", text: finalContent }
-        ]
-      };
+      const result = await executeNaturalLanguageQuery(db, query);
+      return { content: result.content };
     } catch (e) {
       if (e instanceof McpError) {
         logger.warn("Request Blocked", { code: e.code, message: e.message });
@@ -432,14 +487,100 @@ server.registerTool(
   }
 );
 
+/**
+ * Middleware to protect routes with an API Key
+ */
+function apiKeyAuth(req, res, next) {
+  const apiKey = process.env.MCP_API_KEY;
+  if (!apiKey) {
+    // If no key is configured, allow for now but warn (or block in production)
+    logger.warn("MCP_API_KEY is not set in environment. Running without API key protection.");
+    return next();
+  }
+
+  const clientKey = req.headers["x-api-key"] || req.query.apiKey;
+  if (clientKey !== apiKey) {
+    logger.warn(`Unauthorized access attempt from ${req.ip}`);
+    return res.status(401).json({ error: "Unauthorized: Invalid or missing API Key" });
+  }
+  next();
+}
+
 async function main() {
   await initializeDefault();
-  const transport = new StdioServerTransport();
-  await server.connect(transport);
-  console.error("Universal DB MCP Server running on stdio");
+
+  const transportType = process.env.TRANSPORT_TYPE || "stdio";
+
+  if (transportType === "sse") {
+    const app = express();
+    
+    // 1. Security Headers
+    app.use(helmet({
+      contentSecurityPolicy: false, // Disable for easier local testing with our test client
+    }));
+    
+    // 2. CORS
+    app.use(cors());
+    app.use(express.json());
+
+    // 3. Rate Limiting
+    const limiter = rateLimit({
+      windowMs: 15 * 60 * 1000, // 15 minutes
+      max: 100, // Limit each IP to 100 requests per window
+      standardHeaders: true,
+      legacyHeaders: false,
+    });
+    app.use(limiter);
+
+    // 4. API Key Protection (Global for all routes except root)
+    app.use((req, res, next) => {
+      if (req.path === "/" || req.path === "/health") return next();
+      return apiKeyAuth(req, res, next);
+    });
+
+    let sseTransport;
+
+    // 1. MCP SSE Endpoint
+    app.get("/sse", async (req, res) => {
+      sseTransport = new SSEServerTransport("/messages", res);
+      await server.connect(sseTransport);
+      logger.info("New MCP SSE connection established");
+    });
+
+    // 2. MCP Messages Endpoint
+    app.post("/messages", async (req, res) => {
+      if (sseTransport) {
+        await sseTransport.handlePostMessage(req, res);
+      } else {
+        res.status(400).send("No active SSE session");
+      }
+    });
+
+    // 3. Health Check
+    app.get("/health", (req, res) => {
+      res.json({
+        status: "HEALTHY",
+        version: "1.2.0",
+        transport: "sse",
+        databases: connectionManager.list().length
+      });
+    });
+
+    const PORT = process.env.PORT || 3000;
+    app.listen(PORT, () => {
+      logger.info(`Universal DB MCP Server running on SSE/HTTP at http://localhost:${PORT}`);
+      logger.info(`- MCP SSE Endpoint: http://localhost:${PORT}/sse`);
+    });
+
+  } else {
+    // Default to Stdio for Claude Desktop and local testing
+    const transport = new StdioServerTransport();
+    await server.connect(transport);
+    logger.info("Universal DB MCP Server running on stdio");
+  }
 }
 
 main().catch((err) => {
-  console.error("Fatal error during startup:", err);
+  logger.error("Fatal error during startup", err);
   process.exit(1);
 });

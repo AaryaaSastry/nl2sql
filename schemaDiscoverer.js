@@ -5,9 +5,9 @@ import { createClient } from "@supabase/supabase-js";
  * Replaces the need for a static planConfig.js.
  */
 export async function discoverSchema(supabaseClient) {
-  // 1. Fetch all tables and columns from the public schema
+  // 1. Fetch all tables, columns, and types from the public schema
   const { data: columnData, error: columnError } = await supabaseClient.rpc("execute_sql", {
-    sql: `SELECT table_name, column_name FROM information_schema.columns WHERE table_schema = 'public' ORDER BY table_name, ordinal_position`
+    sql: `SELECT table_name, column_name, data_type FROM information_schema.columns WHERE table_schema = 'public' ORDER BY table_name, ordinal_position`
   });
 
   if (columnError) {
@@ -23,13 +23,16 @@ export async function discoverSchema(supabaseClient) {
     throw new Error(`Failed to fetch foreign keys: ${fkError.message}`);
   }
 
-  // 3. Process Columns into { table: [cols] } format
+  // 3. Process Columns and Types
   const schema = {};
+  const types = {};
   columnData.forEach(row => {
     if (!schema[row.table_name]) {
       schema[row.table_name] = [];
+      types[row.table_name] = {};
     }
     schema[row.table_name].push(row.column_name);
+    types[row.table_name][row.column_name] = row.data_type;
   });
 
   // 4. Process Relations (Bidirectional)
@@ -61,6 +64,7 @@ export async function discoverSchema(supabaseClient) {
 
   return {
     schema,
+    types,
     relations,
     allowedAggregations,
     allowedOperators,

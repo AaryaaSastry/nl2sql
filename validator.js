@@ -1,4 +1,5 @@
 import { McpError } from "./errors.js";
+import { findJoinPath } from "./joinResolver.js";
 
 function normalizeDirection(direction) {
   if (!direction) {
@@ -40,16 +41,18 @@ function ensureColumn(config, table, column) {
   }
 }
 
-function ensureJoin(config, baseTable, joinTable) {
-  const actualBase = resolveTable(baseTable);
-  const actualJoin = resolveTable(joinTable);
-  if (!config.relations[actualBase] || !config.relations[actualBase][actualJoin]) {
-    throw new McpError(`Invalid join: ${actualBase} -> ${actualJoin}`, "INVALID_JOIN", { baseTable: actualBase, joinTable: actualJoin });
-  }
-}
+// REMOVED ensureJoin entirely to prevent any accidental usage
 
 function validateColumns(config, baseTable, columns) {
   for (const column of columns) {
+    if (column.toUpperCase().includes("COUNT(") || column.toUpperCase().includes("SUM(") || column.toUpperCase().includes(" AS ")) {
+      throw new McpError(
+        `SQL functions detected in columns list: "${column}". All aggregations MUST be placed in the 'aggregations' array, not in 'columns'.`,
+        "VALIDATION_FAILED",
+        { column }
+      );
+    }
+    
     const resolved = splitQualified(column, baseTable);
     ensureColumn(config, resolved.table, resolved.column);
   }
@@ -76,8 +79,11 @@ function validateAggregations(config, baseTable, aggregations) {
 }
 
 function validateConsistency(plan) {
-  // If aggregations exist, all columns in the 'columns' list must be in groupBy
-  if (plan.aggregations && plan.aggregations.length > 0) {
+  const hasAggregations = plan.aggregations && plan.aggregations.length > 0;
+  const hasGroupBy = plan.groupBy && plan.groupBy.length > 0;
+
+  // If we have aggregations OR a manual groupBy, we MUST ensure all selected columns are grouped
+  if (hasAggregations || hasGroupBy) {
     if (!plan.groupBy) plan.groupBy = [];
     const groupSet = new Set(plan.groupBy);
 
@@ -110,13 +116,15 @@ export function validatePlan(plan, config) {
       const actualBase = resolveTable(baseTable);
       const actualJoin = resolveTable(joinTable);
 
-      // Skip self-joins (already implicitly joined)
       if (actualJoin === actualBase) continue;
-
-      // Skip duplicate joins
       if (uniqueJoins.has(actualJoin)) continue;
 
-      ensureJoin(config, actualBase, actualJoin);
+      try {
+        // Use the transitive path resolver
+        findJoinPath(actualBase, actualJoin, config.relations);
+      } catch (e) {
+        throw new McpError(`No join path found between ${actualBase} and ${actualJoin}. Please check database relationships.`, "INVALID_JOIN", { baseTable: actualBase, joinTable: actualJoin });
+      }
       uniqueJoins.add(actualJoin);
       validatedJoins.push(joinTable);
     }
