@@ -45,15 +45,16 @@ export async function discoverSchema(supabaseClient) {
   fkData.forEach(row => {
     const table = row.table_name;
     const foreignTable = row.foreign_table_name;
-    const joinCondition = `${table}.${row.column_name} = ${foreignTable}.${row.foreign_column_name}`;
+    const forwardCondition = `${table}.${row.column_name} = ${foreignTable}.${row.foreign_column_name}`;
+    const reverseCondition = `${foreignTable}.${row.foreign_column_name} = ${table}.${row.column_name}`;
 
     // A -> B
     if (relations[table]) {
-      relations[table][foreignTable] = joinCondition;
+      relations[table][foreignTable] = forwardCondition;
     }
     // B -> A (Required by joinResolver BFS)
     if (relations[foreignTable]) {
-      relations[foreignTable][table] = joinCondition;
+      relations[foreignTable][table] = reverseCondition;
     }
   });
 

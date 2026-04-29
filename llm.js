@@ -127,7 +127,12 @@ function buildSystemPrompt(config) {
     "6. COLUMN NAMES: Use 'table.column' format.",
     "7. AGGREGATIONS ONLY: All calculations MUST go into the 'aggregations' array.",
     "8. GROUP BY REQUIREMENT: Use 'groupBy' ONLY when 'aggregations' are present.",
-    `9. CURRENT DATE: Today is ${new Date().toISOString().split('T')[0]}.`,
+    "9. Prefer the smallest correct plan. If the question is ambiguous, choose the simplest valid interpretation without inventing joins.",
+    "10. For ranking questions like top/highest/lowest/most/least, include orderBy and a tight limit.",
+    "11. For count/total/average questions, use aggregations instead of putting functions in columns.",
+    "12. Use 'having' for post-aggregation filters such as 'at least 2', 'more than 10', or 'only groups with'.",
+    "13. Use aggregation.condition for conditional counts or sums instead of filtering out the joined rows.",
+    `14. CURRENT DATE: Today is ${new Date().toISOString().split('T')[0]}.`,
     "",
     "Schema:",
     tables,
@@ -135,16 +140,56 @@ function buildSystemPrompt(config) {
     "Joins:",
     joinLines || "(none)",
     "",
-    "Example Output:",
-    JSON.stringify({
-      table: "primaryTable",
-      columns: ["table1.col1"],
-      filters: [{ column: "table.col", operator: "=", value: "val" }],
-      aggregations: [{ type: "SUM", column: "table.col", alias: "total" }],
-      groupBy: ["table.col"],
-      limit: 10,
-      joins: ["table2"]
-    }, null, 2)
+    "Example Output Patterns:",
+    JSON.stringify([
+      {
+        question: "List customers",
+        plan: {
+          table: "customers",
+          columns: ["customers.id", "customers.name"],
+          limit: 10
+        }
+      },
+      {
+        question: "What is total revenue by region?",
+        plan: {
+          table: "orders",
+          columns: ["regions.name"],
+          aggregations: [{ type: "SUM", column: "orders.revenue", alias: "total_revenue" }],
+          groupBy: ["regions.name"],
+          joins: ["regions"],
+          limit: 10
+        }
+      },
+      {
+        question: "Top 5 customers by usage",
+        plan: {
+          table: "customers",
+          columns: ["customers.name"],
+          aggregations: [{ type: "SUM", column: "usage.amount", alias: "total_usage" }],
+          joins: ["usage"],
+          orderBy: { column: "total_usage", direction: "DESC" },
+          limit: 5
+        }
+      },
+      {
+        question: "Factories with at least 2 faulty sensors",
+        plan: {
+          table: "factories",
+          columns: ["factories.name"],
+          aggregations: [{
+            type: "COUNT",
+            column: "sensors.id",
+            alias: "faulty_sensors",
+            condition: { column: "sensors.status", operator: "=", value: "faulty" }
+          }],
+          joins: ["sensors"],
+          groupBy: ["factories.name"],
+          having: [{ column: "faulty_sensors", operator: ">=", value: 2 }],
+          limit: 10
+        }
+      }
+    ], null, 2)
   ].join("\n");
 }
 

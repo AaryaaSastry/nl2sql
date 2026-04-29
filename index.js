@@ -1,10 +1,5 @@
 import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import { StdioServerTransport } from "@modelcontextprotocol/sdk/server/stdio.js";
-import { SSEServerTransport } from "@modelcontextprotocol/sdk/server/sse.js";
-import express from "express";
-import cors from "cors";
-import helmet from "helmet";
-import { rateLimit } from "express-rate-limit";
 import { z } from "zod";
 import dotenv from "dotenv";
 import path from "path";
@@ -21,7 +16,7 @@ import {
   formatStatsAsMarkdown 
 } from "./visualizationService.js";
 import { buildSQL } from "./sqlBuilder.js";
-import { validatePlan } from "./validator.js";
+import { estimatePlanConfidence, validatePlan } from "./validator.js";
 import { callLLM, analyzeResults } from "./llm.js";
 import { ensureSqlSafety } from "./safety.js";
 import { generateInsights } from "./insightGenerator.js";
@@ -210,11 +205,27 @@ const planSchema = z
         z.object({
           type: z.string(),
           column: z.string(),
-          alias: z.string().optional()
+          alias: z.string().optional(),
+          condition: z
+            .object({
+              column: z.string(),
+              operator: z.string(),
+              value: z.union([z.string(), z.number(), z.boolean(), z.null()])
+            })
+            .optional()
         })
       )
       .optional(),
     groupBy: z.array(z.string()).optional(),
+    having: z
+      .array(
+        z.object({
+          column: z.string(),
+          operator: z.string(),
+          value: z.union([z.string(), z.number(), z.boolean(), z.null()])
+        })
+      )
+      .optional(),
     orderBy: z
       .object({
         column: z.string(),
@@ -348,6 +359,15 @@ async function executeNaturalLanguageQuery(db, query) {
 
         plan = await callLLM(currentQuery, config);
         validatedPlan = validatePlan(plan, config);
+
+        const confidence = estimatePlanConfidence(query, validatedPlan, config);
+        if (confidence < 0.6) {
+          throw new McpError(
+            "I could not confidently map your question to the schema. Please name the table, add a filter, or narrow the request.",
+            "LOW_CONFIDENCE",
+            { confidence, plan: validatedPlan }
+          );
+        }
         
         // Step 3: SQL Generation
         const { sql: rawSql, params } = buildSQL(validatedPlan, config);
@@ -509,75 +529,10 @@ function apiKeyAuth(req, res, next) {
 async function main() {
   await initializeDefault();
 
-  const transportType = process.env.TRANSPORT_TYPE || "stdio";
-
-  if (transportType === "sse") {
-    const app = express();
-    
-    // 1. Security Headers
-    app.use(helmet({
-      contentSecurityPolicy: false, // Disable for easier local testing with our test client
-    }));
-    
-    // 2. CORS
-    app.use(cors());
-    app.use(express.json());
-
-    // 3. Rate Limiting
-    const limiter = rateLimit({
-      windowMs: 15 * 60 * 1000, // 15 minutes
-      max: 100, // Limit each IP to 100 requests per window
-      standardHeaders: true,
-      legacyHeaders: false,
-    });
-    app.use(limiter);
-
-    // 4. API Key Protection (Global for all routes except root)
-    app.use((req, res, next) => {
-      if (req.path === "/" || req.path === "/health") return next();
-      return apiKeyAuth(req, res, next);
-    });
-
-    let sseTransport;
-
-    // 1. MCP SSE Endpoint
-    app.get("/sse", async (req, res) => {
-      sseTransport = new SSEServerTransport("/messages", res);
-      await server.connect(sseTransport);
-      logger.info("New MCP SSE connection established");
-    });
-
-    // 2. MCP Messages Endpoint
-    app.post("/messages", async (req, res) => {
-      if (sseTransport) {
-        await sseTransport.handlePostMessage(req, res);
-      } else {
-        res.status(400).send("No active SSE session");
-      }
-    });
-
-    // 3. Health Check
-    app.get("/health", (req, res) => {
-      res.json({
-        status: "HEALTHY",
-        version: "1.2.0",
-        transport: "sse",
-        databases: connectionManager.list().length
-      });
-    });
-
-    const PORT = process.env.PORT || 3000;
-    app.listen(PORT, () => {
-      logger.info(`Universal DB MCP Server running on SSE/HTTP at http://localhost:${PORT}`);
-      logger.info(`- MCP SSE Endpoint: http://localhost:${PORT}/sse`);
-    });
-
-  } else {
-    // Default to Stdio for Claude Desktop and local testing
-    const transport = new StdioServerTransport();
-    await server.connect(transport);
-    logger.info("Universal DB MCP Server running on stdio");
-  }
+  // Claude Desktop uses stdio transport. Keep the server process attached to the client.
+  const transport = new StdioServerTransport();
+  await server.connect(transport);
+  logger.info("Universal DB MCP Server running on stdio");
 }
 
 main().catch((err) => {
