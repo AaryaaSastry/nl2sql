@@ -1,0 +1,1 @@
+export { executeNaturalLanguageQuery } from "./src/query/queryExecutor.js";

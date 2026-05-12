@@ -1,5 +1,5 @@
-export { buildSQL } from "./src/core/sqlBuilder.js";
-
+import { findJoinPath } from "./joinResolver.js";
+import { validateSqlExpression } from "./safety.js";
 
 function buildOperandSql(column, value, params) {
   if (validateSqlExpression(value)) {
@@ -79,10 +79,6 @@ function buildAggregationExpression(agg, params) {
   };
 }
 
-/**
- * Generates SQL from a structured plan.
- * Returns { sql, params }
- */
 export function buildSQL(plan, config) {
   const {
     table,
@@ -147,7 +143,7 @@ export function buildSQL(plan, config) {
 
   let whereClause = "";
   if (filters.length > 0) {
-    const filterStrings = filters.map((f, i) => {
+    const filterStrings = filters.map((f) => {
       if (f.operator === "IS NULL" || f.operator === "IS NOT NULL") {
         return `${f.column} ${f.operator}`;
       }
@@ -155,10 +151,8 @@ export function buildSQL(plan, config) {
       const isSqlExpression = validateSqlExpression(f.value);
 
       if (isSqlExpression) {
-        // Direct injection for whitelisted SQL expressions
         return `${f.column} ${f.operator} ${f.value}`;
       } else {
-        // Standard parameterization for literals
         params.push(f.value);
         return `${f.column} ${f.operator} $${params.length}`;
       }
@@ -187,7 +181,6 @@ export function buildSQL(plan, config) {
     havingClause = `HAVING ${havingStrings.join(" AND ")}`;
   }
 
-  // Automatic GROUP BY for non-aggregated columns if aggregations are present
   let finalGroupBy = [...groupBy];
   if (aggregations.length > 0) {
     for (const col of columns) {

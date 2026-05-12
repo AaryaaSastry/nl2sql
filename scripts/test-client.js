@@ -12,12 +12,12 @@ async function main() {
 
   const client = new Client({ name: "test-client", version: "1.0.0" });
   await client.connect(transport);
-  
+
   const response = await client.callTool({
     name: "list_databases",
     arguments: {}
   });
-  
+
   console.log(response.content[0].text);
   process.exit(0);
 }
