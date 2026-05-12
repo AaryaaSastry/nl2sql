@@ -9,6 +9,7 @@
   },
   "scripts": {
     "start": "node index.js",
+    "start:http": "node -e \"process.env.PORT=3000; process.env.USE_SSE='true'; require('./index.js')\"",
     "dev": "node --watch index.js"
   },
   "dependencies": {
@@ -19,6 +20,7 @@
     "express": "^5.2.1",
     "express-rate-limit": "^8.4.0",
     "helmet": "^8.1.0",
+    "xlsx": "^0.18.5",
     "zod": "^3.22.4"
   },
   "devDependencies": {

@@ -1,5 +1,10 @@
 import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import { StdioServerTransport } from "@modelcontextprotocol/sdk/server/stdio.js";
+import { SSEServerTransport } from "@modelcontextprotocol/sdk/server/sse.js";
+import express from "express";
+import cors from "cors";
+import helmet from "helmet";
+import rateLimit from "express-rate-limit";
 import { z } from "zod";
 import dotenv from "dotenv";
 import path from "path";
@@ -20,6 +25,7 @@ import { estimatePlanConfidence, validatePlan } from "./validator.js";
 import { callLLM, analyzeResults } from "./llm.js";
 import { ensureSqlSafety } from "./safety.js";
 import { generateInsights } from "./insightGenerator.js";
+import { excelService } from "./excelService.js";
 import { McpError, logger } from "./errors.js";
 
 // Load default connection if provided in .env
@@ -507,6 +513,174 @@ server.registerTool(
   }
 );
 
+server.registerTool(
+  "read_excel",
+  {
+    title: "Read Excel file",
+    description: "Read data from an Excel file (.xlsx, .xls, .csv). Returns the content as JSON.",
+    inputSchema: z.object({
+      path: z.string().describe("Absolute path to the Excel file"),
+      sheetName: z.string().optional().describe("Name of the sheet to read (defaults to the first sheet)")
+    })
+  },
+  async ({ path, sheetName }) => {
+    try {
+      const result = await excelService.readExcel(path, sheetName);
+      
+      // Limit output size to prevent overloading the LLM context if data is massive
+      const MAX_ROWS = 500;
+      let displayData = result.data;
+      let note = "";
+      
+      if (result.data.length > MAX_ROWS) {
+        displayData = result.data.slice(0, MAX_ROWS);
+        note = `\n\n*Note: Only showing the first ${MAX_ROWS} rows of ${result.rowCount} total rows.*`;
+      }
+
+      return {
+        content: [{
+          type: "text",
+          text: `### 📊 Excel Data: ${result.sheetName}\n` +
+                `**Total Rows:** ${result.rowCount}\n` +
+                `**Available Sheets:** ${result.availableSheets.join(", ")}\n\n` +
+                JSON.stringify(displayData, null, 2) +
+                note
+        }]
+      };
+    } catch (e) {
+      return {
+        content: [{ type: "text", text: `Error reading Excel: ${e.message}` }],
+        isError: true
+      };
+    }
+  }
+);
+
+server.registerTool(
+  "list_excel_sheets",
+  {
+    title: "List Excel sheets",
+    description: "List all sheet names in an Excel file.",
+    inputSchema: z.object({
+      path: z.string().describe("Absolute path to the Excel file")
+    })
+  },
+  async ({ path }) => {
+    try {
+      const sheets = await excelService.listSheets(path);
+      return {
+        content: [{
+          type: "text",
+          text: `Sheets found in "${path}":\n${sheets.map(s => `- ${s}`).join("\n")}`
+        }]
+      };
+    } catch (e) {
+      return {
+        content: [{ type: "text", text: `Error listing sheets: ${e.message}` }],
+        isError: true
+      };
+    }
+  }
+);
+
+server.registerTool(
+  "export_query_to_excel",
+  {
+    title: "Export query results to Excel",
+    description: "Execute a SQL query and save the results to an Excel file.",
+    inputSchema: z.object({
+      db: z.string().optional().default("default").describe("Database alias"),
+      sql: z.string().describe("The SQL query to execute"),
+      outputPath: z.string().describe("Absolute path where the Excel file will be saved (e.g., 'C:/Users/Acer/Downloads/report.xlsx')"),
+      sheetName: z.string().optional().default("Results").describe("Name of the Excel sheet")
+    })
+  },
+  async ({ db, sql, outputPath, sheetName }) => {
+    try {
+      const { supabase } = connectionManager.get(db);
+      
+      ensureSqlSafety(sql);
+      
+      const rpcName = process.env.SUPABASE_SQL_RPC || "execute_sql";
+      const { data, error } = await supabase.rpc(rpcName, { sql });
+
+      if (error) throw new Error(error.message);
+      if (!data || data.length === 0) {
+        return { content: [{ type: "text", text: "Query returned no data. Excel file not created." }] };
+      }
+
+      const savedPath = await excelService.writeExcel(outputPath, data, sheetName);
+      
+      return {
+        content: [{
+          type: "text",
+          text: `Successfully exported ${data.length} rows to "${savedPath}".`
+        }]
+      };
+    } catch (e) {
+      return {
+        content: [{ type: "text", text: `Error exporting to Excel: ${e.message}` }],
+        isError: true
+      };
+    }
+  }
+);
+
+server.registerTool(
+  "import_excel_to_table",
+  {
+    title: "Import Excel to database table",
+    description: "Read data from an Excel file and insert it into a database table. Note: Columns in Excel must match table column names.",
+    inputSchema: z.object({
+      db: z.string().optional().default("default").describe("Database alias"),
+      path: z.string().describe("Absolute path to the Excel file"),
+      table: z.string().describe("Target table name"),
+      sheetName: z.string().optional().describe("Sheet name to import (defaults to first sheet)")
+    })
+  },
+  async ({ db, path, table, sheetName }) => {
+    try {
+      const { supabase, config } = connectionManager.get(db);
+      
+      if (!config.schema[table]) {
+        throw new Error(`Table "${table}" does not exist in database "${db}".`);
+      }
+
+      const result = await excelService.readExcel(path, sheetName);
+      
+      if (result.rowCount === 0) {
+        return { content: [{ type: "text", text: "Excel sheet is empty. Nothing to import." }] };
+      }
+
+      // Insert data in batches of 500
+      const BATCH_SIZE = 500;
+      let importedCount = 0;
+      
+      for (let i = 0; i < result.data.length; i += BATCH_SIZE) {
+        const batch = result.data.slice(i, i + BATCH_SIZE);
+        const { error } = await supabase.from(table).insert(batch);
+        
+        if (error) {
+          throw new Error(`Error importing batch starting at row ${i + 1}: ${error.message}`);
+        }
+        importedCount += batch.length;
+      }
+
+      return {
+        content: [{
+          type: "text",
+          text: `Successfully imported ${importedCount} rows from "${result.sheetName}" into table "${table}".`
+        }]
+      };
+    } catch (e) {
+      return {
+        content: [{ type: "text", text: `Error importing Excel: ${e.message}` }],
+        isError: true
+      };
+    }
+  }
+);
+
 /**
  * Middleware to protect routes with an API Key
  */
@@ -529,10 +703,45 @@ function apiKeyAuth(req, res, next) {
 async function main() {
   await initializeDefault();
 
-  // Claude Desktop uses stdio transport. Keep the server process attached to the client.
-  const transport = new StdioServerTransport();
-  await server.connect(transport);
-  logger.info("Universal DB MCP Server running on stdio");
+  if (process.env.USE_SSE === 'true') {
+    const app = express();
+    app.use(cors());
+    app.use(helmet());
+    
+    const limiter = rateLimit({
+      windowMs: 15 * 60 * 1000, // 15 minutes
+      limit: 100, // Limit each IP to 100 requests per `window` (here, per 15 minutes).
+      standardHeaders: 'draft-7', // draft-6: `RateLimit-*` headers; draft-7: combined `RateLimit` header
+      legacyHeaders: false, // Disable the `X-RateLimit-*` headers.
+    });
+    app.use(limiter);
+
+    let transport;
+
+    app.get("/sse", apiKeyAuth, async (req, res) => {
+      const clientKey = req.headers["x-api-key"] || req.query.apiKey;
+      const messagesUrl = clientKey ? `/messages?apiKey=${clientKey}` : "/messages";
+      transport = new SSEServerTransport(messagesUrl, res);
+      await server.connect(transport);
+    });
+
+    app.post("/messages", apiKeyAuth, async (req, res) => {
+      if (!transport) {
+        return res.status(400).send("No active SSE connection");
+      }
+      await transport.handlePostMessage(req, res);
+    });
+
+    const port = process.env.PORT || 3000;
+    app.listen(port, () => {
+      logger.info(`Universal DB MCP Server running on HTTP SSE at http://localhost:${port}/sse`);
+    });
+  } else {
+    // Claude Desktop uses stdio transport. Keep the server process attached to the client.
+    const transport = new StdioServerTransport();
+    await server.connect(transport);
+    logger.info("Universal DB MCP Server running on stdio");
+  }
 }
 
 main().catch((err) => {

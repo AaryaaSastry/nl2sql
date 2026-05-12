@@ -23,6 +23,7 @@ async function fetchWithRetry(url, options, maxRetries = 3) {
       if (response.status === 429 || response.status >= 500) {
         const delay = Math.pow(2, i) * 1000;
         console.error(`[LLM] API Error ${response.status}. Retrying in ${delay}ms...`);
+        lastError = new Error(`API returned status ${response.status}`);
         await new Promise(r => setTimeout(r, delay));
         continue;
       }
@@ -31,21 +32,21 @@ async function fetchWithRetry(url, options, maxRetries = 3) {
       
       // Check for Gemini internal errors
       if (result.error) {
-        throw new Error(`Gemini API Error: ${result.error.message} (${result.error.status})`);
+        throw new Error(`Gemini API Error: ${result.error?.message || 'Unknown'} (${result.error?.status || 'Unknown'})`);
       }
 
       clearTimeout(timeoutId);
       return result;
     } catch (e) {
       lastError = e;
-      if (e.name === 'AbortError') throw new Error(`LLM Request timed out after ${DEFAULT_TIMEOUT}ms`);
+      if (e && e.name === 'AbortError') throw new Error(`LLM Request timed out after ${DEFAULT_TIMEOUT}ms`);
       if (i === maxRetries - 1) break;
       await new Promise(r => setTimeout(r, 1000));
     }
   }
   
   clearTimeout(timeoutId);
-  throw lastError;
+  throw lastError || new Error("LLM Request failed after retries");
 }
 
 /**
